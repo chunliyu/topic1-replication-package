@@ -1,143 +1,101 @@
-import os, sys
-import re
-import shutil
-import subprocess
+import os, sys, re, shutil, subprocess, re, platform, json, pickle, timeit, multiprocessing
 from sys import stderr
-import platform
 from tqdm import tqdm
 from numba import jit, cuda
 from timeit import default_timer as timer
 import pandas as pd
-import json
-import pprint
-import pickle
-import timeit
+from pydriller import Git
+
 # Run shell command from a string
+sys.path.append(os.getcwd())
 sys.path.append("..")
 from config import config_global
+from utils import Git_repo
+import numpy as np
 #from pydriller import Git
 #from pydriller import Repository
 
 
-# Run shell command from a string
-def shellCommand(command_str):
-    #cd print("command_str: ", command_str)
-    cmd = subprocess.Popen(command_str.split(' '), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    cmd_out, cmd_err = cmd.communicate()
-    return cmd_out, cmd_err
+def detect_clones_on_commit(project, commit_id, nicad_workdir, cmd_nicad, nicad_clone_file_path):
+    #nicad_workdir_commit = os.path.join(config_global.REPO_PATH, nicad_workdir, "%s_%s" % (nicad_workdir, commit_id))
 
-'''
-def get_commits(project_repo):
-    n = 0
-    git_repo = Repository(project_repo, only_in_branch="master")
-    for commit in git_repo.traverse_commits():
-        short_sha = git_repo.git.rev_parse(commit.hash, short=8)
-        print(short_sha)
-        n = n + 1
-    print(n)
+    child = subprocess.Popen('rm -rf %s/%s_functions*' % (nicad_workdir, project), shell=True)
+    child.poll()
 
-    # git_repo.get_list_commits(rev='HEAD')
-'''
+    project_repo = os.path.join(nicad_workdir, project)
+    # shellCommand('git checkout %s' % commit_id) # optimize: can be checked out using pydriller.Git().checkout(hash)
+    try:
+        # cmd_checkout_commit = 'git checkout -f %s' % commit_id
+        # shellCommand(cmd_checkout_commit) # we use subprocess.run to do it
+        subprocess.run(['git', 'checkout', '-f', commit_id], cwd=project_repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE) # check out local repo to the newest commit
+        
+        # perform clone detection by NiCad
+        subprocess.run(cmd_nicad, cwd=nicad_workdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE) # check out local repo to the newest commit
 
+        # clear working space
+        dest_path = '%s/%s/%s.xml' % (config_global.CLONE_RESULT_PATH, project, commit_id)
+        if os.path.exists(dest_path):
+            shellCommand('rm -rf %s' % dest_path)
 
-def get_all_commits(project_path):
-    command_str = 'git log --pretty=format:"%h, %ae, %ai, %s" > ' + commits_log_path
-    shellCommand(command_str)
+        if os.path.exists(nicad_clone_file_path):
+            # move the results to the result folder
+            shutil.move(nicad_clone_file_path, dest_path)
+            # delete NiCad output files
+        
+        # clean memory
+        # shellCommand(cmd_clear_cache) cmd_clear_cache = 'sudo sysctl -w vm.drop_caches=3' # no privileges on gpu1
+    except Exception as e:
+        print("err: ", commit_id, e)
+        sys.exit(-1)
 
-
-def generate_commits_log(commits_log_path):
-    current_dir = os.getcwd()
-    project_repo = os.path.join(config_global.REPO_PATH, project)
-    os.chdir(project_repo)
-    cmd_git_log = 'git log --pretty=format:"%h, %ae, %ai, %s" > ' % commits_log_path
-    # git log --pretty=format:"%h,%ce,%ci" > ~/clone2api/data/commit_logs_clean/presto_logs.txt
-    # git log --pretty=format:"%h,%ce,%ci,%s" > ~/clone2api/data/commit_logs/presto_logs.txt
-
-    # git log --pretty=format:"%h,%ce,%ci" > ~/scratch/clone2api/data/commit_logs_clean/Terasology_logs.txt
-    # git log --pretty=format:"%h,%ce,%ci" > ~/clone2api/data/commit_logs_clean/netty_logs.txt
-    # git log --pretty=format:"%h,%ce,%ci,%s" > ~/clone2api/data/commit_logs/netty_logs.txt
-    shellCommand(cmd_git_log)
-    os.chdir(current_dir)
 
 # function optimized to run on gpu
 #@jit(target_backend='cuda')
-def detect_clones_on_commits(commits_to_run):
-    for commit_id in tqdm(commits_to_run):
-        # checkout a specific commit
-        # shellCommand('git checkout %s' % commit_id) # optimize: can be checked out using pydriller.Git().checkout(hash)
-        try:
-            os.chdir(project_repo)
+def detect_clones_on_commits(project):
+    print("project: ", project)
+    # clean previous clone results and make the results' directory
 
-            cmd_checkout_commit = 'git checkout -f %s' % commit_id
-            shellCommand(cmd_checkout_commit)
+    # git_repo = Git(project_repo)
+    nicad_workdir = os.path.join(config_global.REPO_PATH, 'nicad_workdir_%s' % project)
+    project_repo = os.path.join(nicad_workdir, project)
+    project_language = Git_repo.get_project_programming_language(project).lower()
+    # cmd_nicad_str = 'nicad6 functions %s %s' % (project_language.lower(), project_repo)
+    cmd_nicad = ['nicad6', 'functions', project_language, project_repo]
+    nicad_clone_file_path = os.path.join(nicad_workdir, '%s_functions-blind-clones' % project,
+                            '%s_functions-blind-clones-0.30-classes-withsource.xml' % project)
 
-            # clone detection
-            # perform clone detection by NiCad
-            os.chdir(nicad_workdir)
-            shellCommand(cmd_nicad)
+    # 优化1：7000/1000 commits change java file,  => apollo: (2843, 3) 925
+    # only run commits that have changes, i.e., commit_id is in commit_modifications_dict
+    commit_log_df = Git_repo.load_commit_log_df(project)
+    commit_modifications_dict = Git_repo.load_commit_modifications_dict(project)
+    commits_modified = commit_modifications_dict.keys()
+    indices_commits_modified = commit_log_df[commit_log_df['commit_id'].isin(commits_modified)].index
+    expanded_indices = np.concatenate([indices_commits_modified, indices_commits_modified + 1]) # Expand the indices to include index+1
+    commits = commit_log_df.loc[expanded_indices]['commit_id']
 
-            # clear
-            dest_path = '%s/%s/%s.xml' % (config_global.CLONE_RESULT_PATH, project, commit_id)
-            if os.path.exists(dest_path):
-                shellCommand('rm -rf %s' % dest_path)
-            if os.path.exists(src_path):
-                # move the results to the result folder
-                shutil.move(src_path, dest_path)
-                # delete NiCad output files
+    # resume from the clone detection breakpoint
+    clone_result_path = os.path.join(config_global.CLONE_RESULT_PATH, project)
+    os.makedirs(clone_result_path, exist_ok=True) # cmd_mkdir_clone_result = 'mkdir -p %s/%s' % (config_global.CLONE_RESULT_PATH, project)
+    clone_result_extracted = [x.split(".")[0] for _, _, files in os.walk(clone_result_path) for x in files] # remove the posix 
+    commits_to_run = list(set(commits) - set(clone_result_extracted)) # commits_to_run = list(set(commit_log_df['commit_id']) - set(clone_result_extracted) - set()) 
 
-            child = subprocess.Popen('rm -rf %s/%s_functions*' % (nicad_workdir, project), shell=True)
-            child.poll()
-            # clean memory
-            # shellCommand(cmd_clear_cache)
-        except Exception as e:
-            print("err: ", commit_id, e)
-            sys.exit(1)
+    for commit_id in tqdm(commits_to_run): 
+        '''
+        优化1：7000/1000 commits change java file,  => apollo: (2843, 3) 925
+        优化2: for a hash, if not java mofification, ignore; else generate new dir, 对于每个commit，创建单独的工作目录
+        优化3: python multi-processing
+        '''
+        detect_clones_on_commit(project, commit_id, nicad_workdir, cmd_nicad, nicad_clone_file_path)
 
 
 if __name__ == "__main__":
     start = timer()
-    project = config_global.PROJECT
-    language = 'c' # 'java'
 
+    total_cores = multiprocessing.cpu_count()
+    multiprocessing_cores = int(total_cores * 0.7)
+    pool = multiprocessing.Pool(processes=min(len(config_global.SUBJECT_SYSTEMS_TEST.keys()), multiprocessing_cores))  # Adjust the number of processes as needed
+    pool.map(detect_clones_on_commits, config_global.SUBJECT_SYSTEMS_TEST.keys())
+    pool.close()
+    pool.join()
 
-    if len(sys.argv) > 1:
-        project = sys.argv[1]
-
-    print("project: ", project)
-    #for project in config_global.PROJECTS:
-    commits_log_path = os.path.join(config_global.COMMIT_LOG_CLEAN_PATH, '%s_logs.txt' % project)
-    if not os.path.exists(commits_log_path):
-        generate_commits_log(commits_log_path)
-
-    # clean previous clone results and make the results' directory
-    subprocess.Popen('rm -rf %s/%s_functions*' % (config_global.REPO_PATH, project), shell=True)
-    cmd_mkdir_clone_result = 'mkdir -p %s/%s' % (config_global.CLONE_RESULT_PATH, project)
-    shellCommand(cmd_mkdir_clone_result)
-
-    # read from clean commit log
-    commits_log_df = pd.read_csv(commits_log_path, header=None, names=['commit_id', 'committer', 'timestamp'])
-    #commits_log_df.sort_values('timestamp', inplace=True)
-    print(commits_log_df.shape)
-
-    current_dir = os.getcwd()
-    nicad_workdir = os.path.join(config_global.REPO_PATH, 'nicad_workdir_%s' % project)
-    print("nicad_workdir: ", nicad_workdir)
-    project_repo = os.path.join(nicad_workdir, project)
-
-    # git_repo = Git(project_repo)
-
-    cmd_nicad = 'nicad6 functions %s %s' % (language, project_repo)
-    print(cmd_nicad)
-    cmd_clear_cache = 'sudo sysctl -w vm.drop_caches=3'
-    src_path = os.path.join(nicad_workdir, '%s_functions-blind-clones' % project,
-                            '%s_functions-blind-clones-0.30-classes-withsource.xml' % project)
-    #commit_list = ['1bdb28e']
-    #for index, commit_id in tqdm(commits_log_df['commit_id'].iteritems()):
-    for i, j, k in os.walk(os.path.join(config_global.CLONE_RESULT_PATH, project)):
-        clone_result_extracted = list(map(lambda x: x.split(".")[0], k))  # remove the posix
-
-    # for index, commit_id in tqdm(commits_log_df['commit_id'].iteritems()):
-    commits_to_run = list(set(commits_log_df['commit_id']) - set(clone_result_extracted))
-    #for commit_id in tqdm(list(commits_log_df['commit_id'])):
-    detect_clones_on_commits(commits_to_run)
     print("with GPU:", timer() - start)
